@@ -22,8 +22,19 @@ void *handle_client(void *arg)
     // Используем умный указатель для автоматического освобождения памяти
     std::unique_ptr<ClientData> data(static_cast<ClientData *>(arg));
 
+    FILE *pipe = popen("php -r 'echo phpversion();'", "r");
+    char buffer[16];              // Буфер для версии PHP (достаточно для типичных версий вроде "8.2.15")
+    fscanf(pipe, "%15s", buffer); // Ограничиваем длину для безопасности
+    std::string php_version = buffer;
+    pclose(pipe);
+
     // Формируем HTTP-ответ с номером запроса
-    std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nRequest number " + std::to_string(data->request_num) + " has been processed";
+    std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n"
+                           "<!DOCTYPE html><html><head><title>Bye-bye baby bye-bye</title>"
+                           "<body><h1>Goodbye, world!\n PHP:" +
+                           php_version +
+                           "</h1></body></html>\r\n" +
+                           std::to_string(data->request_num) + " has been processed";
 
     // Отправляем ответ клиенту
     send(data->client_fd, response.c_str(), response.size(), 0);
@@ -83,9 +94,14 @@ int main()
         // Создаем объект данных для передачи в поток
         ClientData *data = new ClientData{client_fd, request_count};
         pthread_t thread;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
 
+        // Вывод информации о размере стека
+        size_t stack_size = 2048 * 1024; // Стек
+        pthread_attr_setstacksize(&attr, stack_size);
         // Создаем поток для обработки запроса
-        if (pthread_create(&thread, nullptr, handle_client, data) != 0)
+        if (pthread_create(&thread, &attr, handle_client, data) != 0)
         {
             perror("Thread creation error");
             delete data; // Удаляем объект данных в случае ошибки

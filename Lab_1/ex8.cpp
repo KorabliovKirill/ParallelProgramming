@@ -27,7 +27,7 @@ void *thread_job(void *arg)
     for (unsigned int i = 0; i < params->batch_size; i++)
     {
         params->first_number_ptr[i] = params->func_ptr(params->first_number_ptr[i]);
-        usleep(100); // Симуляция вычислительной нагрузки
+        usleep(1000); // Симуляция вычислительной нагрузки
     }
 
     auto end = high_resolution_clock::now();
