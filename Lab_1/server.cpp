@@ -4,7 +4,9 @@
 #include <cstring>     // Строковые операции
 #include <arpa/inet.h> // Библиотека для работы с интернет-протоколами
 #include <unistd.h>    // Библиотека для POSIX системных вызовов
-#include <pthread.h>   // POSIX потоки
+#include <stdexcept>
+#include <array>
+#include <pthread.h> // POSIX потоки
 
 #define PORT 8080 // Порт сервера
 #define BACKLOG 5 // Очередь подключений
@@ -16,31 +18,80 @@ struct ClientData
     int request_num; // Номер запроса
 };
 
-// Функция обработки клиентского запроса
 void *handle_client(void *arg)
 {
-    // Используем умный указатель для автоматического освобождения памяти
+    // Умный указатель для автоматического управления памятью
     std::unique_ptr<ClientData> data(static_cast<ClientData *>(arg));
 
-    FILE *pipe = popen("php -r 'echo phpversion();'", "r");
-    char buffer[16];              // Буфер для версии PHP (достаточно для типичных версий вроде "8.2.15")
-    fscanf(pipe, "%15s", buffer); // Ограничиваем длину для безопасности
-    std::string php_version = buffer;
-    pclose(pipe);
+    try
+    {
+        // Буфер для получения данных от клиента
+        std::array<char, 1024> request_buffer{};
 
-    // Формируем HTTP-ответ с номером запроса
-    std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n"
-                           "<!DOCTYPE html><html><head><title>Bye-bye baby bye-bye</title>"
-                           "<body><h1>Goodbye, world!\n PHP:" +
-                           php_version +
-                           "</h1></body></html>\r\n" +
-                           std::to_string(data->request_num) + " has been processed";
+        // Читаем запрос клиента (хотя бы первую часть для корректной работы с HTTP)
+        ssize_t bytes_received = recv(data->client_fd, request_buffer.data(),
+                                      request_buffer.size() - 1, 0);
+        if (bytes_received < 0)
+        {
+            throw std::runtime_error("Failed to receive client request: " +
+                                     std::string(strerror(errno)));
+        }
 
-    // Отправляем ответ клиенту
-    send(data->client_fd, response.c_str(), response.size(), 0);
+        // Получаем версию PHP
+        std::string php_version;
+        {
+            FILE *pipe = popen("php -r 'echo phpversion();'", "r");
+            if (!pipe)
+            {
+                throw std::runtime_error("Failed to open pipe to PHP");
+            }
 
-    // Закрываем соединение с клиентом
-    close(data->client_fd);
+            std::array<char, 16> php_buffer{};
+            if (fgets(php_buffer.data(), php_buffer.size(), pipe) != nullptr)
+            {
+                php_version = php_buffer.data();
+                php_version = php_version.substr(0, php_version.find('\n'));
+            }
+            pclose(pipe);
+        }
+
+        // Формируем HTTP-ответ
+        std::string response =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=UTF-8\r\n"
+            "Connection: close\r\n"
+            "Content-Length: ";
+
+        std::string body =
+            "<!DOCTYPE html>"
+            "<html><head><title>Bye-bye baby bye-bye</title></head>"
+            "<body><h1>Goodbye, world!\n PHP:" +
+            php_version + "</h1>"
+                          "<p>Request #" +
+            std::to_string(data->request_num) +
+            " has been processed</p>"
+            "</body></html>\r\n";
+
+        response += std::to_string(body.length()) + "\r\n\r\n" + body;
+
+        // Отправляем ответ с проверкой ошибок
+        ssize_t bytes_sent = send(data->client_fd, response.c_str(),
+                                  response.length(), 0);
+        if (bytes_sent < 0)
+        {
+            throw std::runtime_error("Failed to send response: " +
+                                     std::string(strerror(errno)));
+        }
+
+        // Корректное завершение соединения
+        shutdown(data->client_fd, SHUT_RDWR);
+        close(data->client_fd);
+    }
+    catch (const std::exception &e)
+    {
+        close(data->client_fd);
+    }
+
     return nullptr;
 }
 
