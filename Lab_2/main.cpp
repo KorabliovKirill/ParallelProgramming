@@ -1,266 +1,185 @@
 #include <chrono>
-#include <cmath>
-#include <cstdlib>
-#include <cstring>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <pthread.h>
 #include <unistd.h>
+#include <vector>
 
-using namespace std;
 using namespace std::chrono;
 
-#define err_exit(code, str)                                                    \
-  {                                                                            \
-    cerr << str << ": " << strerror(code) << endl;                             \
-    exit(EXIT_FAILURE);                                                        \
-  }
+// Глобальный мьютекс для защиты вывода
+std::mutex cout_mutex;
 
-const int TASKS_COUNT = 10;
-// Количество потоков можно изменить здесь или передать как аргумент командной
-// строки
-const int DEFAULT_THREADS_COUNT = 12;
-
-int task_execution_count[TASKS_COUNT] = {0}; // Счетчик выполнений каждой задачи
-volatile int current_task = 0; // Указатель на текущее задание
-volatile bool done = false;  // Флаг завершения
-pthread_mutex_t mutex;       // Мьютекс
-pthread_spinlock_t spinlock; // Спинлок
-
-// Структура для пользовательской условной переменной
-struct custom_cond_t {
-  pthread_mutex_t cond_mutex; // Мьютекс для защиты состояния
-  volatile bool can_proceed; // Флаг разрешения продолжения
+// Структура параметров для MapReduce
+struct MapReduceParams {
+  float *data;                        // Массив данных
+  unsigned int data_size;             // Размер массива
+  float (*map_func)(float);           // Функция map
+  float (*reduce_func)(float, float); // Функция reduce
+  unsigned int threads_count;         // Количество потоков
 };
 
-// Инициализация пользовательской условной переменной
-void custom_cond_init(custom_cond_t *cond) {
-  int err = pthread_mutex_init(&cond->cond_mutex, NULL);
-  if (err != 0)
-    err_exit(err, "Cannot initialize cond mutex");
-  cond->can_proceed = true; // Изначально разрешаем первому потоку начать
-}
+// Структура для этапа map
+struct MapThreadParams {
+  float *data;
+  unsigned int batch_size;
+  float (*map_func)(float);
+  unsigned int thread_index;
+};
 
-// Ожидание условия
-void custom_cond_wait(custom_cond_t *cond) {
-  int err = pthread_mutex_lock(&cond->cond_mutex);
-  if (err != 0)
-    err_exit(err, "Cannot lock cond mutex");
-
-  while (!cond->can_proceed && !done) {
-    pthread_mutex_unlock(&cond->cond_mutex);
-    usleep(1); // Короткая задержка для снижения нагрузки
-    pthread_mutex_lock(&cond->cond_mutex);
-  }
-
-  // Сбрасываем флаг для следующего потока
-  if (!done) {
-    cond->can_proceed = false;
-  }
-
-  err = pthread_mutex_unlock(&cond->cond_mutex);
-  if (err != 0)
-    err_exit(err, "Cannot unlock cond mutex");
-}
-
-// Сигнализация условия
-void custom_cond_signal(custom_cond_t *cond) {
-  int err = pthread_mutex_lock(&cond->cond_mutex);
-  if (err != 0)
-    err_exit(err, "Cannot lock cond mutex");
-
-  cond->can_proceed = true; // Разрешаем следующему потоку продолжить
-
-  err = pthread_mutex_unlock(&cond->cond_mutex);
-  if (err != 0)
-    err_exit(err, "Cannot unlock cond mutex");
-}
-
-// Уничтожение пользовательской условной переменной
-void custom_cond_destroy(custom_cond_t *cond) {
-  pthread_mutex_destroy(&cond->cond_mutex);
-}
-
-// Глобальные объекты для синхронизации
-custom_cond_t cond;
-pthread_mutex_t cond_access_mutex; // Мьютекс для защиты доступа к current_task
-
-void do_task(int task_no) {
-  pthread_t thread_id = pthread_self();
-  cout << "Поток " << thread_id << " выполняет задачу " << task_no << endl;
-  task_execution_count[task_no]++;
-
-  double result = 0;
-  for (int i = 0; i < 10000; i++) {
-    result += sin(cos((double)i / 1000.0));
-  }
-
-  cout << "Поток " << thread_id << " завершил задачу " << task_no
-       << " (результат: " << result << ")" << endl;
-}
-
-void *thread_job(void *arg) {
-  int task_no;
-  int err;
-  int sync_type =
-      *((int *)arg); // 0 - мьютекс, 1 - спинлок, 2 - условная переменная
-
-  while (true) {
-    usleep(rand() % 50); // Задержка для конкуренции
-    if (sync_type == 0) {
-      // Мьютекс
-      err = pthread_mutex_lock(&mutex);
-      if (err != 0)
-        err_exit(err, "Cannot lock mutex");
-    } else if (sync_type == 1) {
-      // Спинлок
-      err = pthread_spin_lock(&spinlock);
-      if (err != 0)
-        err_exit(err, "Cannot lock spinlock");
-    } else {
-      // Условная переменная: защищаем доступ к current_task
-      err = pthread_mutex_lock(&cond_access_mutex);
-      if (err != 0)
-        err_exit(err, "Cannot lock cond access mutex");
-      custom_cond_wait(&cond); // Ожидаем разрешения
-    }
-
-    // Критическая секция
-    int temp = current_task; // Читаем значение
-    usleep(rand() % 10); // Микрозадержка перед инкрементом
-    current_task = temp + 1; // Неатомарная операция
-    task_no = temp;
-
-    if (sync_type == 0) {
-      err = pthread_mutex_unlock(&mutex);
-      if (err != 0)
-        err_exit(err, "Cannot unlock mutex");
-    } else if (sync_type == 1) {
-      err = pthread_spin_unlock(&spinlock);
-      if (err != 0)
-        err_exit(err, "Cannot unlock spinlock");
-    } else {
-      custom_cond_signal(&cond); // Сигнализируем следующему потоку
-      err = pthread_mutex_unlock(&cond_access_mutex);
-      if (err != 0)
-        err_exit(err, "Cannot unlock cond access mutex");
-    }
-
-    if (task_no < TASKS_COUNT) {
-      do_task(task_no);
-    } else {
-      if (sync_type == 2) {
-        // Устанавливаем флаг завершения и сигнализируем всем потокам
-        done = true;
-        custom_cond_signal(&cond);
-      }
-      return NULL;
-    }
-  }
-}
-
-int main(int argc, char *argv[]) {
-  int threads_count = (argc > 1) ? atoi(argv[1]) : DEFAULT_THREADS_COUNT;
-
-  pthread_t *threads = new pthread_t[threads_count];
-  int err;
-
-  // Инициализация мьютекса
-  err = pthread_mutex_init(&mutex, NULL);
-  if (err != 0)
-    err_exit(err, "Cannot initialize mutex");
-
-  // Инициализация спинлока
-  err = pthread_spin_init(&spinlock, PTHREAD_PROCESS_PRIVATE);
-  if (err != 0)
-    err_exit(err, "Cannot initialize spinlock");
-
-  // Инициализация пользовательской условной переменной
-  custom_cond_init(&cond);
-  err = pthread_mutex_init(&cond_access_mutex, NULL);
-  if (err != 0)
-    err_exit(err, "Cannot initialize cond access mutex");
-
-  // 1. Тест с мьютексом
-  int sync_type = 0;
+// Функция для этапа map
+void *map_thread_job(void *arg) {
+  MapThreadParams *params = static_cast<MapThreadParams *>(arg);
   auto start = high_resolution_clock::now();
 
-  for (int i = 0; i < threads_count; ++i) {
-    err = pthread_create(&threads[i], NULL, thread_job, &sync_type);
-    if (err != 0)
-      err_exit(err, "Cannot create thread");
-  }
-
-  for (int i = 0; i < threads_count; ++i) {
-    pthread_join(threads[i], NULL);
+  for (unsigned int i = 0; i < params->batch_size; i++) {
+    params->data[i] = params->map_func(params->data[i]);
+    usleep(1000); // Симуляция вычислительной нагрузки
   }
 
   auto end = high_resolution_clock::now();
-  auto duration = duration_cast<milliseconds>(end - start);
-  cout << "Время выполнения с мьютексом: " << duration.count() << " мс" << endl
-       << endl;
+  std::lock_guard<std::mutex> lock(cout_mutex);
+  std::cout << "Map Thread " << params->thread_index + 1 << " execution time: "
+            << duration_cast<microseconds>(end - start).count() << " us"
+            << std::endl;
 
-  // Сбрасываем счетчики и флаги
-  for (int i = 0; i < TASKS_COUNT; i++) {
-    task_execution_count[i] = 0;
+  return nullptr;
+}
+
+// Структура для этапа reduce
+struct ReduceThreadParams {
+  std::vector<float> *mapped_data;
+  unsigned int start_idx;
+  unsigned int batch_size;
+  float (*reduce_func)(float, float);
+  float *partial_result;
+  unsigned int thread_index;
+};
+
+// Функция для этапа reduce
+void *reduce_thread_job(void *arg) {
+  ReduceThreadParams *params = static_cast<ReduceThreadParams *>(arg);
+  auto start = high_resolution_clock::now();
+
+  float result = params->mapped_data->at(params->start_idx);
+  for (unsigned int i = 1; i < params->batch_size; i++) {
+    result = params->reduce_func(
+        result, params->mapped_data->at(params->start_idx + i));
   }
-  current_task = 0;
-  done = false;
+  *params->partial_result = result;
 
-  // 2. Тест со спинлоком
-  sync_type = 1;
-  start = high_resolution_clock::now();
+  auto end = high_resolution_clock::now();
+  std::lock_guard<std::mutex> lock(cout_mutex);
+  std::cout << "Reduce Thread " << params->thread_index + 1
+            << " execution time: "
+            << duration_cast<microseconds>(end - start).count() << " us"
+            << std::endl;
 
-  for (int i = 0; i < threads_count; ++i) {
-    err = pthread_create(&threads[i], NULL, thread_job, &sync_type);
-    if (err != 0)
-      err_exit(err, "Cannot create thread");
-  }
+  return nullptr;
+}
 
-  for (int i = 0; i < threads_count; ++i) {
-    pthread_join(threads[i], NULL);
-  }
+// Функция MapReduce
+float map_reduce(MapReduceParams *params) {
+  auto start_total = high_resolution_clock::now();
 
-  end = high_resolution_clock::now();
-  duration = duration_cast<milliseconds>(end - start);
-  cout << "Время выполнения со спинлоком: " << duration.count() << " мс" << endl
-       << endl;
+  // Этап 1: Map
+  std::vector<pthread_t> map_threads(params->threads_count);
+  std::vector<MapThreadParams> map_params(params->threads_count);
+  unsigned int batch_size = params->data_size / params->threads_count;
+  unsigned int rest = params->data_size % params->threads_count;
 
-  // Сбрасываем счетчики и флаги
-  for (int i = 0; i < TASKS_COUNT; i++) {
-    task_execution_count[i] = 0;
-  }
-  current_task = 0;
-  done = false;
-
-  // 3. Тест с пользовательской условной переменной
-  sync_type = 2;
-  start = high_resolution_clock::now();
-
-  for (int i = 0; i < threads_count; ++i) {
-    err = pthread_create(&threads[i], NULL, thread_job, &sync_type);
-    if (err != 0)
-      err_exit(err, "Cannot create thread");
-  }
-
-  for (int i = 0; i < threads_count; ++i) {
-    pthread_join(threads[i], NULL);
-  }
-
-  end = high_resolution_clock::now();
-  duration = duration_cast<milliseconds>(end - start);
-  cout << "Время выполнения с условной переменной: " << duration.count()
-       << " мс" << endl;
-
-  cout << "\nСтатистика выполнения задач:" << endl;
-  for (int i = 0; i < TASKS_COUNT; i++) {
-    cout << "Задача " << i << " выполнена " << task_execution_count[i] << " раз"
-         << endl;
+  for (unsigned int i = 0; i < params->threads_count; ++i) {
+    unsigned int current_batch_size =
+        batch_size + (i == params->threads_count - 1 ? rest : 0);
+    map_params[i] = {params->data + i * batch_size, current_batch_size,
+                     params->map_func, i};
+    pthread_create(&map_threads[i], nullptr, map_thread_job, &map_params[i]);
   }
 
-  pthread_mutex_destroy(&mutex);
-  pthread_spin_destroy(&spinlock);
-  custom_cond_destroy(&cond);
-  pthread_mutex_destroy(&cond_access_mutex);
-  delete[] threads;
-  return 0;
+  for (auto &thread : map_threads) {
+    pthread_join(thread, nullptr);
+  }
+
+  // Этап 2: Reduce
+  std::vector<float> mapped_data(params->data,
+                                 params->data + params->data_size);
+  std::vector<pthread_t> reduce_threads(params->threads_count);
+  std::vector<ReduceThreadParams> reduce_params(params->threads_count);
+  std::vector<float> partial_results(params->threads_count, 0.0);
+
+  batch_size = mapped_data.size() / params->threads_count;
+  rest = mapped_data.size() % params->threads_count;
+
+  for (unsigned int i = 0; i < params->threads_count; ++i) {
+    unsigned int current_batch_size =
+        batch_size + (i == params->threads_count - 1 ? rest : 0);
+    reduce_params[i] = {&mapped_data,        i * batch_size,
+                        current_batch_size,  params->reduce_func,
+                        &partial_results[i], i};
+    pthread_create(&reduce_threads[i], nullptr, reduce_thread_job,
+                   &reduce_params[i]);
+  }
+
+  for (auto &thread : reduce_threads) {
+    pthread_join(thread, nullptr);
+  }
+
+  // Финальное объединение результатов
+  float final_result = partial_results[0];
+  for (unsigned int i = 1; i < params->threads_count; i++) {
+    final_result = params->reduce_func(final_result, partial_results[i]);
+  }
+
+  auto end_total = high_resolution_clock::now();
+  std::lock_guard<std::mutex> lock(cout_mutex);
+  std::cout << "Total MapReduce execution time: "
+            << duration_cast<microseconds>(end_total - start_total).count()
+            << " us" << std::endl;
+
+  return final_result;
+}
+
+void initialize_array(unsigned int length, float *arr) {
+  for (unsigned int i = 0; i < length; i++) {
+    arr[i] = static_cast<float>(i);
+  }
+}
+
+// Пример функций map и reduce
+float map_func(float x) {
+  return x * x; // Возведение в квадрат
+}
+
+float reduce_func(float a, float b) {
+  return a + b; // Суммирование
+}
+
+int main(int argc, char *argv[]) {
+  if (argc < 3) {
+    std::cerr << "Usage: " << argv[0] << " <array_length> <threads_count>"
+              << std::endl;
+    return EXIT_FAILURE;
+  }
+
+  unsigned int array_length = atoi(argv[1]);
+  unsigned int threads_count = atoi(argv[2]);
+  threads_count = std::min(threads_count, array_length);
+
+  std::unique_ptr<float[]> data(new float[array_length]);
+  initialize_array(array_length, data.get());
+
+  MapReduceParams params = {data.get(), array_length, map_func, reduce_func,
+                            threads_count};
+  float result = map_reduce(&params);
+
+  std::cout << "\nMapReduce result: " << result << std::endl;
+
+  // Вывод массива после MapReduce (для проверки)
+  std::cout << "Array after MapReduce:" << std::endl;
+  for (unsigned int i = 0; i < array_length; i++) {
+    std::cout << "arr[" << i << "] = " << data[i] << std::endl;
+  }
+
+  return EXIT_SUCCESS;
 }
